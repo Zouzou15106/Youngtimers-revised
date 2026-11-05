@@ -1,0 +1,714 @@
+## =============================================================================
+##  Youngtimers and the financialization of new collectibles
+##  Single documented run: produces every table, figure and robustness output
+##  reported in the manuscript and in the supplementary material.
+##  Second-round revision (FRL-D-26-05740). Changes marked '# R2'.
+##  Inputs : Supplementary_material.xlsx  sheets 'Data' and 'Indices_monthly'
+##           TB3MS.xlsx (3-month Treasury bill, FRED)                      # R2
+##  Output : youngtimers_results_R2.xlsx + fig1.png fig2.png fig3.png
+## =============================================================================
+suppressPackageStartupMessages({
+  library(readxl); library(dplyr); library(stringr); library(flexmix)
+  library(sandwich); library(lmtest); library(car); library(zoo)
+  library(openxlsx); library(strucchange)
+})
+set.seed(1)
+
+## ---- 0. inputs -------------------------------------------------------------
+## Place these two files in the working directory before running:
+##   SUP : the supplementary workbook, sheets "Data" and "Indices_monthly"
+##   TBF : only needed on the first run. The 3-month Treasury bill (FRED, TB3MS) is
+##         read from the "tb3" column of "Indices_monthly" when the workbook already
+##         carries it, as the regenerated workbook does; otherwise from this CSV
+##         (columns date, TB3MS).
+SUP <- "Supplementary_material.xlsx"
+TBF <- "TB3MS.csv"
+OUT <- "output"; dir.create(OUT, showWarnings = FALSE)
+
+Final_data <- as.data.frame(read_excel(SUP, sheet = "Data"))
+monthly_data_indexes <- as.data.frame(read_excel(SUP, sheet = "Indices_monthly"))
+
+## ---- 1. auction data ---------------------------------------------------------
+d <- Final_data; names(d) <- trimws(names(d))
+## Column names carry French accents. Matching them on ASCII-stripped patterns keeps the   # R3
+## script runnable whatever the locale of the machine.                                     # R3
+asc  <- iconv(names(d), to = "ASCII", sub = "")
+pick <- function(p) { i <- grep(p, asc, perl = TRUE); stopifnot(length(i) == 1L); names(d)[i] }
+MAP  <- c(model = pick("^Type"), myear = pick("^Ann.*Mod"), syear = pick("^Ann.*vente"),
+          sdate = pick("^Date"), price = pick("^Prix"), country = pick("New country"),
+          house = pick("Auction House"), auth = "Authenticity", tmu = "TMU", mi = "MI",
+          trans = "Transmission", dir = "Direction")
+DATE_COL <- MAP[["sdate"]]
+names(d)[match(MAP, names(d))] <- names(MAP)
+d_raw <- d                                                                               # R3
+d <- d %>% mutate(auth = dplyr::recode(toupper(str_trim(auth)), "ORIGINAL & HIGHLY ORIGINAL" = "ORIGINAL",
+                              "UNABLE TO DETERMINE" = "NOT SPECIFIED"),
+         country = dplyr::recode(toupper(str_trim(country)), "GRB" = "GBR"),
+         trans = toupper(str_trim(trans)), dir = toupper(str_trim(dir)),
+         lnprice = log(price), mi_k = mi/1000, mi_k2 = (mi/1000)^2,
+         age = syear - myear, tmu = as.integer(tmu))
+d$sdate <- if (inherits(Final_data[[DATE_COL]], "Date")) as.Date(Final_data[[DATE_COL]]) else
+  as.Date(d$sdate, format = "%d/%m/%Y")
+d$agec <- d$age - mean(d$age); d$agec2 <- d$agec^2            # age is MEAN-CENTRED      # R2
+pool <- function(x, n = 30) { t <- table(x); ifelse(x %in% names(t[t < n]), "OTHER", x) }
+d$house <- pool(d$house); d$country <- pool(d$country)
+d$auth <- relevel(factor(d$auth), ref = "ORIGINAL")
+for (v in c("model","country","house","trans","dir")) d[[v]] <- factor(d[[v]])
+d$month <- format(d$sdate, "%Y-%m"); d$qtr <- as.yearqtr(d$sdate)
+d$sem <- paste0(format(d$sdate, "%Y"), "-H", ifelse(as.integer(format(d$sdate, "%m")) <= 6, 1, 2))
+mk_f <- function(x) factor(x, levels = sort(unique(x)))
+d$month_f <- mk_f(d$month); d$qtr_f <- mk_f(as.character(d$qtr)); d$sem_f <- mk_f(d$sem)
+d$qc <- as.character(d$qtr_f); PER <- levels(d$qtr_f)
+d$POST <- as.integer(d$qc >= "2021 Q1"); d$manual <- as.integer(d$trans == "MANUAL")
+HED <- "agec+agec2+mi_k+mi_k2+tmu+auth+trans+dir+model+country+house"
+SEG_HED <- "agec+agec2+mi_k+mi_k2+tmu+auth+trans+dir+model"
+adapt <- function(sub) { f <- "lnprice ~ agec+agec2+mi_k+mi_k2"
+  for (v in c("tmu","auth","trans","dir","model","country","house"))
+    if (length(unique(sub[[v]])) > 1) f <- paste0(f, "+", v); f }
+
+## ---- 2. benchmark basket: quarterly averages and quarter-end levels ----------  # R2
+raw <- monthly_data_indexes; names(raw)[1] <- "date"; raw$date <- as.Date(raw$date)
+ren <- c(K50="K50",K500="K500",Coins="Coins",Gold="Gold",MSCI="MSCI",BTC="BTC",SP500="SP500",
+         rf="rf",Wine="Wine",Art="Art",ArtC="ArtC",Whisky="Whisky",VIX="VIX")
+cols <- intersect(names(ren), names(raw))
+if (!"tb3" %in% names(raw)) {                                               # R2
+  stopifnot(file.exists(TBF))
+  tb <- read.csv(TBF); tb$date <- as.Date(tb$date)
+  raw$tb3 <- tb$TB3MS[match(format(raw$date, "%Y-%m"), format(tb$date, "%Y-%m"))]
+}
+stopifnot(!all(is.na(raw$tb3)))
+raw$qtr <- as.character(as.yearqtr(raw$date))
+cols2 <- c(cols, "tb3")
+basket_q <- raw %>% group_by(qtr) %>% summarise(across(all_of(cols2), ~mean(.x, na.rm = TRUE)),
+  .groups = "drop") %>% arrange(qtr) %>% filter(qtr <= max(PER))
+basket_e <- raw %>% filter(qtr <= max(PER)) %>% group_by(qtr) %>%           # quarter-end  # R2
+  summarise(across(all_of(cols2), ~{v <- .x[!is.na(.x)]; if (length(v)) tail(v,1) else NA_real_}),
+            .groups = "drop") %>% arrange(qtr)
+mk_from <- function(B) { m <- data.frame(qtr = B$qtr)
+  for (a in c("MSCI","SP500","BTC","K500","K50")) m[[a]] <- c(NA, diff(B[[a]])/head(B[[a]],-1))
+  m$rf <- B$tb3/400; m$rf10 <- B$rf/400; m$POST <- as.integer(m$qtr >= "2021 Q1"); m }
+mkt_r <- mk_from(basket_q); mkt_e <- mk_from(basket_e)
+
+## ---- 3. hedonic indices, confidence band, implicit prices -------------------
+index_from <- function(fit, tvar) { lev <- levels(fit$model[[tvar]]); cc <- coef(fit)
+  th <- setNames(rep(0, length(lev)), lev); nm <- paste0(tvar, lev)
+  hit <- nm %in% names(cc); th[hit] <- cc[nm[hit]]
+  data.frame(period = lev, index = 100*exp(th - th[1]), row.names = NULL) }
+band_from <- function(fit, tvar, cl) { lev <- levels(fit$model[[tvar]]); cc <- coef(fit)
+  V <- vcovCL(fit, cluster = cl); nm <- paste0(tvar, lev)
+  th <- se <- setNames(rep(0, length(lev)), lev); hit <- nm %in% names(cc)
+  th[hit] <- cc[nm[hit]]; se[hit] <- sqrt(diag(V)[nm[hit]])
+  data.frame(period = lev, index = 100*exp(th), lo = 100*exp(th-1.96*se), hi = 100*exp(th+1.96*se)) }
+fit_freq <- function(tv) lm(as.formula(paste0("lnprice~", HED, "+", tv)), data = d)
+m_month <- fit_freq("month_f"); m_qtr <- fit_freq("qtr_f"); m_sem <- fit_freq("sem_f")
+idx_month <- index_from(m_month,"month_f"); idx_qtr <- index_from(m_qtr,"qtr_f")
+idx_sem <- index_from(m_sem,"sem_f")
+idx_band <- band_from(m_qtr, "qtr_f", ~ qtr_f)                                        # R2
+Vcl <- vcovCL(m_qtr, cluster = ~ qtr_f); b <- coef(m_qtr); Pmed <- median(d$price)
+coef_tab <- as.data.frame(coeftest(m_qtr, vcov = Vcl)[, ])
+coef_tab <- cbind(term = rownames(coef_tab), coef_tab); rownames(coef_tab) <- NULL
+coef_tab$effect_pct <- round((exp(coef_tab$Estimate)-1)*100, 2)
+coef_tab$usd_median <- round((exp(coef_tab$Estimate)-1)*Pmed, 0)
+## R2: marginal effects at the median for the quadratic variables (replaces the
+## linear-only conversion in the published Table 3)
+mm <- median(d$mi_k); am <- median(d$age) - mean(d$age)
+marg <- function(v1, v2, x) b[v1] + 2*b[v2]*x
+coef_tab$usd_marginal <- coef_tab$usd_median
+coef_tab$usd_marginal[coef_tab$term == "mi_k"] <- round(marg("mi_k","mi_k2",mm)*Pmed, 0)
+coef_tab$usd_marginal[coef_tab$term == "agec"] <- round(marg("agec","agec2",am)*Pmed, 0)
+coef_tab$usd_marginal[coef_tab$term %in% c("mi_k2","agec2")] <- NA
+marg_tab <- data.frame(
+  variable = c("Mileage (per 1,000 mi)","Mileage","Mileage","Age (per year)","Age","Age"),
+  point = c("10-20k mi","median (65k mi)","110-120k mi","10 years","median (22 years)","40 years"),
+  pct = round(100*c(marg("mi_k","mi_k2",15), marg("mi_k","mi_k2",mm), marg("mi_k","mi_k2",115),
+                    marg("agec","agec2",10-mean(d$age)), marg("agec","agec2",am),
+                    marg("agec","agec2",40-mean(d$age))), 3),
+  usd = round(Pmed*c(marg("mi_k","mi_k2",15), marg("mi_k","mi_k2",mm), marg("mi_k","mi_k2",115),
+                     marg("agec","agec2",10-mean(d$age)), marg("agec","agec2",am),
+                     marg("agec","agec2",40-mean(d$age))), 0))
+diag_tab <- data.frame(stat = c("N","R2_adj","BreuschPagan_p","DurbinWatson","mean_age",
+    "median_age","median_mileage_k","median_price","age_turning_point","max_age_observed"),
+  value = c(nobs(m_qtr), summary(m_qtr)$adj.r.squared, bptest(m_qtr)$p.value,
+            dwtest(m_qtr, order.by = order(d$sdate))$statistic, mean(d$age), median(d$age),
+            mm, Pmed, mean(d$age) - b["agec"]/(2*b["agec2"]), max(d$age)))
+gvif <- as.data.frame(vif(m_qtr)); gvif <- cbind(term = rownames(gvif), gvif); rownames(gvif) <- NULL
+
+## ---- 4. A1: use attributes interacted with the break ------------------------
+m_a1 <- lm(as.formula(paste0("lnprice~", HED, "+qtr_f+(agec+agec2+mi_k+mi_k2+tmu+manual):POST")), data = d)
+V_a1 <- vcovCL(m_a1, cluster = ~ qtr_f); ip <- grep(":POST$", names(coef(m_a1)), value = TRUE)
+a1_inter <- as.data.frame(coeftest(m_a1, vcov = V_a1)[ip, , drop = FALSE])
+a1_inter <- cbind(term = rownames(a1_inter), a1_inter); rownames(a1_inter) <- NULL
+a1_wald <- data.frame(test = c("all use x POST","mileage","age profile"),
+  p = c(linearHypothesis(m_a1, ip, vcov. = V_a1, test = "F")[2,"Pr(>F)"],
+        linearHypothesis(m_a1, c("mi_k:POST","mi_k2:POST"), vcov. = V_a1, test = "F")[2,"Pr(>F)"],
+        linearHypothesis(m_a1, c("agec:POST","agec2:POST"), vcov. = V_a1, test = "F")[2,"Pr(>F)"]))
+b1 <- coef(m_a1)
+a1_mileage <- data.frame(period = c("pre","post"), pct_per_1000mi = 100*c(
+  b1["mi_k"] + 2*b1["mi_k2"]*mm,
+  b1["mi_k"] + b1["mi_k:POST"] + 2*(b1["mi_k2"] + b1["mi_k2:POST"])*mm))
+idx_usePOST <- index_from(m_a1, "qtr_f")                                              # R2
+
+## ---- 5. index allowing all implicit prices to drift (chained) ---------------  # R2
+ch <- 100
+for (k in 2:length(PER)) { sub <- droplevels(d[d$qc %in% PER[(k-1):k], ])
+  sub$T2 <- as.integer(sub$qc == PER[k])
+  ch <- c(ch, ch[k-1]*exp(coef(lm(as.formula(paste0(adapt(sub), "+T2")), data = sub))["T2"])) }
+idx_chain <- data.frame(period = PER, index = ch)
+
+## ---- 6. fixed model-and-platform composition --------------------------------  # R2
+cellk <- d %>% count(model, house, name = "n_tot") %>% filter(n_tot >= 60)
+dk <- droplevels(d %>% semi_join(cellk, by = c("model","house")))
+idx_fixed <- index_from(lm(as.formula(paste0(adapt(dk), "+qtr_f")), data = dk), "qtr_f")
+
+## ---- 7. finite mixture ------------------------------------------------------
+idx_ret <- function(ix) setNames(c(NA, diff(ix$index)/head(ix$index,-1)), ix$period)
+idx_ret_full <- function(ix, allp) { v <- setNames(rep(NA_real_, length(allp)), allp)
+  v[ix$period] <- ix$index; r <- c(NA, diff(v)/head(v,-1)); names(r) <- allp; r[is.finite(r)] }
+interp_index <- function(ix) { v <- setNames(rep(NA_real_, length(PER)), PER); v[ix$period] <- ix$index
+  k <- which(!is.na(v))[1]
+  data.frame(period = PER[k:length(PER)],
+             index = as.numeric(na.approx(unname(v[k:length(v)]), na.rm = FALSE))) }
+fmm_by_k <- lapply(1:4, function(K) { set.seed(1)
+  stepFlexmix(as.formula(paste0("lnprice~", SEG_HED)), data = d, k = K, nrep = 5,
+              control = list(minprior = 0.05), verbose = FALSE) })
+fmm_sel <- data.frame(k = 1:4, logLik = sapply(fmm_by_k, function(m) as.numeric(logLik(m))),
+  AIC = sapply(fmm_by_k, AIC), BIC = sapply(fmm_by_k, BIC),
+  sizes = sapply(fmm_by_k, function(m) paste(as.integer(table(clusters(m))), collapse = "/")))
+fm <- fmm_by_k[[3]]; d$seg <- clusters(fm); segs <- sort(unique(d$seg))
+reg_index <- function(ii) { sub <- droplevels(d[ii, ])
+  index_from(lm(as.formula(paste0(adapt(sub), "+qtr_f")), data = sub), "qtr_f") }
+mkts <- c("MSCI","SP500","BTC","K500")
+comov <- function(sr, mk = mkt_r) sapply(mkts, function(m) {
+  j <- merge(data.frame(qtr = names(sr), s = as.numeric(sr)), mk[, c("qtr", m)], by = "qtr")
+  j <- j[complete.cases(j), ]; cor(j$s, j[[m]]) })
+rl0 <- lapply(segs, function(s) idx_ret(interp_index(reg_index(d$seg == s))))
+cm <- t(sapply(rl0, comov))
+i1 <- which.max(cm[,"SP500"]); i3 <- which.min(cm[,"SP500"]); i2 <- setdiff(seq_along(segs), c(i1,i3))
+labels3 <- character(length(segs)); labels3[i1] <- "R1"; labels3[i2] <- "R2"; labels3[i3] <- "R3"
+d$segn <- labels3[match(d$seg, segs)]
+seg_comovement <- data.frame(segment = labels3, n = sapply(segs, function(s) sum(d$seg == s)),
+                             round(cm, 3), row.names = NULL)
+seg_idx <- Reduce(function(a,b) merge(a,b,by="period",all=TRUE), Map(function(s,l) {
+  x <- interp_index(reg_index(d$seg == s)); names(x)[2] <- paste0("index_", l); x }, segs, labels3))
+seg_band <- do.call(rbind, lapply(seq_along(segs), function(k) {               # R2
+  sub <- droplevels(d[d$seg == segs[k], ])
+  bb <- band_from(lm(as.formula(paste0(adapt(sub), "+qtr_f")), data = sub), "qtr_f", ~ qtr_f)
+  cbind(regime = labels3[k], bb) }))
+em_pt <- as.data.frame(parameters(fm)); colnames(em_pt) <- labels3[seq_len(ncol(em_pt))]
+em_pt <- cbind(term = rownames(em_pt), round(em_pt, 6), row.names = NULL)
+pr <- round(prior(fm), 3); em_prior <- data.frame(term = "prior_proportion", matrix(pr, nrow = 1))
+colnames(em_prior)[-1] <- labels3[seq_along(pr)]
+em_estimates <- rbind(em_pt, em_prior[, names(em_pt)])
+em_inference <- tryCatch({ s <- summary(refit(fm))
+  do.call(rbind, lapply(seq_along(s@components), function(k) { ct <- as.data.frame(s@components[[k]])
+    data.frame(segment = labels3[k], term = rownames(ct), estimate = round(ct[,1],4),
+      std_error = round(ct[,2],4), z = round(ct[,3],2), p = signif(ct[,4],3), row.names = NULL) })) },
+  error = function(e) data.frame(note = paste("refit unavailable:", conditionMessage(e))))
+seg_profile <- d %>% group_by(segn) %>% summarise(n = n(), price_median = median(price),
+  km_median = median(mi), pct_manual = round(mean(trans == "MANUAL"),2),
+  pct_original = round(mean(auth == "ORIGINAL"),2), .groups = "drop")
+seg_cars <- d %>% count(segn, model) %>% group_by(segn) %>%
+  mutate(share = round(100*n/sum(n),1)) %>% arrange(segn, desc(share)) %>% ungroup()
+seg_model_price <- do.call(rbind, lapply(labels3, function(l) { sub <- droplevels(d[d$segn == l, ])
+  f <- lm(as.formula(paste0(adapt(sub), "+qtr_f")), data = sub); cc <- coef(f)
+  mc <- cc[grepl("^model", names(cc))]
+  data.frame(model = sub("^model","",names(mc)), implicit_pct = round(100*(exp(mc)-1),1),
+             seg = l, row.names = NULL) }))
+tab_pp <- table(d$POST, d$segn); n_pp <- as.data.frame.matrix(tab_pp)
+pct_pp <- round(100*as.data.frame.matrix(prop.table(tab_pp,1)),1); names(pct_pp) <- paste0("pct_", names(pct_pp))
+seg_share_prepost <- data.frame(period = c("pre","post"), n_pp, pct_pp, row.names = NULL)
+seg_share_year <- data.frame(year = rownames(prop.table(table(format(d$sdate,"%Y"), d$segn),1)),
+  round(100*as.data.frame.matrix(prop.table(table(format(d$sdate,"%Y"), d$segn),1)),1), row.names = NULL)
+## R2: posterior-weighted shares  s_kt = sum(tau_ik)/n_t
+P0 <- posterior(fm); colnames(P0) <- labels3[match(segs, segs)]
+seg_share_soft <- rbind(
+  data.frame(period = "pre",  t(round(100*colMeans(P0[d$POST == 0, , drop = FALSE]),1))),
+  data.frame(period = "post", t(round(100*colMeans(P0[d$POST == 1, , drop = FALSE]),1))))
+seg_share_soft_year <- do.call(rbind, lapply(sort(unique(format(d$sdate,"%Y"))), function(y)
+  data.frame(year = y, t(round(100*colMeans(P0[format(d$sdate,"%Y") == y, , drop = FALSE]),1)))))
+seg_age <- d %>% group_by(segn) %>% summarise(age_med = median(age), age_p90 = quantile(age,.9),
+  pct_30plus = round(100*mean(age >= 30),1), mi_med = median(mi), .groups = "drop")
+seg_risk <- do.call(rbind, lapply(seq_along(segs), function(k) { r <- rl0[[k]]; r <- r[is.finite(r)]
+  data.frame(segment = labels3[k], ann_ret = round(mean(r)*400,2), ann_vol = round(sd(r)*200,2)) }))
+## R2: thin quarters and interpolation
+seg_thin <- NULL
+for (l in c("R1","R2","R3")) for (mn in c(0,5,10,20)) {
+  sub0 <- droplevels(d[d$segn == l, ]); keep <- names(which(table(sub0$qtr_f) >= mn))
+  if (length(keep) < 8) { seg_thin <- rbind(seg_thin, data.frame(regime=l, min_sales=mn, quarters=NA,
+    end_interp=NA, ann_ret_interp=NA, ann_ret_gaps=NA, vol_interp=NA, vol_gaps=NA)); next }
+  sub <- droplevels(sub0[as.character(sub0$qtr_f) %in% keep, ])
+  ix <- index_from(lm(as.formula(paste0(adapt(sub), "+qtr_f")), data = sub), "qtr_f")
+  ri <- idx_ret(interp_index(ix)); rg <- idx_ret_full(ix, PER)
+  seg_thin <- rbind(seg_thin, data.frame(regime=l, min_sales=mn, quarters=nrow(ix),
+    end_interp=round(tail(interp_index(ix)$index,1),1), ann_ret_interp=round(400*mean(ri,na.rm=TRUE),2),
+    ann_ret_gaps=round(400*mean(rg,na.rm=TRUE),2), vol_interp=round(200*sd(ri,na.rm=TRUE),2),
+    vol_gaps=round(200*sd(rg,na.rm=TRUE),2))) }
+
+## ---- 8. mixture robustness: common time, house and country effects ---------  # R2
+ARI <- function(a,b) { t <- table(a,b); n <- sum(t); ch <- function(x) x*(x-1)/2
+  si <- sum(ch(rowSums(t))); sj <- sum(ch(colSums(t))); sij <- sum(ch(t))
+  e <- si*sj/ch(n); (sij-e)/(0.5*(si+sj)-e) }
+relabel <- function(cl) { u <- sort(unique(cl))
+  rl <- lapply(u, function(s) idx_ret(interp_index(reg_index(cl == s))))
+  cx <- t(sapply(rl, comov)); j1 <- which.max(cx[,"SP500"]); j3 <- which.min(cx[,"SP500"])
+  j2 <- setdiff(seq_along(u), c(j1,j3)); lb <- character(length(u))
+  lb[j1] <- "R1"; lb[j2] <- "R2"; lb[j3] <- "R3"
+  list(lab = lb[match(cl,u)], cm = cx, rets = rl, ord = c(j1,j2,j3), labs = lb, u = u) }
+d$res1 <- residuals(lm(lnprice ~ qtr_f + house + country, data = d))
+d$res2 <- residuals(lm(lnprice ~ qtr_f, data = d))
+set.seed(1); fm1 <- stepFlexmix(as.formula(paste0("res1~", SEG_HED)), data = d, k = 3, nrep = 5,
+  control = list(minprior = 0.05), verbose = FALSE)
+set.seed(1); fm2 <- stepFlexmix(as.formula(paste0("res2~", SEG_HED, "+house+country")), data = d,
+  k = 3, nrep = 5, control = list(minprior = 0.05), verbose = FALSE)
+R0 <- list(lab = d$segn, cm = cm, rets = rl0, ord = c(i1,i2,i3), labs = labels3, u = segs)
+RB <- list(M0 = R0, M1 = relabel(clusters(fm1)), M2 = relabel(clusters(fm2)))
+mixture_robust <- do.call(rbind, lapply(names(RB), function(nm) { R <- RB[[nm]]
+  k1 <- R$ord[1]; k2 <- R$ord[2]
+  ix1 <- interp_index(reg_index(R$lab == "R1")); ix2 <- interp_index(reg_index(R$lab == "R2"))
+  cl <- if (nm == "M0") d$seg else if (nm == "M1") clusters(fm1) else clusters(fm2)
+  Pm <- if (nm == "M0") P0 else posterior(if (nm == "M1") fm1 else fm2)
+  hp <- round(100*table(R$lab[d$POST == 0])/sum(d$POST == 0),1)
+  hq <- round(100*table(R$lab[d$POST == 1])/sum(d$POST == 1),1)
+  data.frame(spec = nm, sizes = paste(as.integer(table(cl)), collapse="/"),
+    ARI_vs_M0 = round(ARI(d$seg, cl),3), mean_max_posterior = round(mean(apply(Pm,1,max)),3),
+    share_post_gt_09 = round(mean(apply(Pm,1,max) > 0.9),3),
+    R1_share_pre = hp["R1"], R1_share_post = hq["R1"],
+    R1_rho_SP = round(R$cm[k1,"SP500"],3), R1_rho_K500 = round(R$cm[k1,"K500"],3),
+    R1_end = round(tail(ix1$index,1),1), R2_end = round(tail(ix2$index,1),1),
+    R1_vol = round(200*sd(R$rets[[k1]], na.rm=TRUE),2), R2_vol = round(200*sd(R$rets[[k2]], na.rm=TRUE),2),
+    R1_price_med = median(d$price[R$lab == "R1"]), R1_pct30 = round(100*mean(d$age[R$lab=="R1"] >= 30),1),
+    row.names = NULL) }))
+mixture_crosstab <- rbind(
+  cbind(pair = "M0 x M1", as.data.frame.matrix(table(R0$lab, RB$M1$lab)) %>% mutate(M0 = rownames(.))),
+  cbind(pair = "M0 x M2", as.data.frame.matrix(table(R0$lab, RB$M2$lab)) %>% mutate(M0 = rownames(.))))
+
+## ---- 9. performance -------------------------------------------------------
+assets <- c("Youngtimer","K500","K50","Wine","Art","ArtC","Whisky","Coins","Gold","MSCI","SP500","BTC")
+mkret <- function(B, rfcol) { L <- merge(B, setNames(idx_qtr, c("qtr","Youngtimer")), by="qtr", all.x=TRUE) %>% arrange(qtr)
+  R <- L; for (a in intersect(assets, names(L))) R[[a]] <- L[[a]]/dplyr::lag(L[[a]]) - 1
+  R$rf_q <- L[[rfcol]]/400; R$qk <- as.integer(sub("(\\d{4}) Q(\\d)","\\1\\2",R$qtr)); R }
+metrics <- function(R, mkt = "SP500") { out <- lapply(assets, function(a) {
+  r <- R[[a]][is.finite(R[[a]])]; if (length(r) < 4) return(rep(NA,8))
+  am <- mean(r)*4*100; av <- sd(r)*2*100; lc <- cumprod(1+r); dd <- min(lc/cummax(lc)-1)*100
+  sh <- (mean(R[[a]]-R$rf_q, na.rm=TRUE)*4)/(sd(R[[a]], na.rm=TRUE)*2)
+  s <- na.omit(data.frame(y = R[[a]]-R$rf_q, x = R[[mkt]]-R$rf_q))
+  reg <- if (nrow(s) > 4) lm(y~x, s) else NULL
+  c(n = length(r), Ret = round(am,2), Vol = round(av,2), MaxDD = round(dd,2), Sharpe = round(sh,3),
+    Alpha = if (!is.null(reg)) round(coef(reg)[1]*400,2) else NA,
+    Beta = if (!is.null(reg)) round(coef(reg)[2],3) else NA,
+    CorrYT = if (a == "Youngtimer") 1 else round(cor(R[[a]], R$Youngtimer, use="complete.obs"),3)) })
+  data.frame(asset = assets, do.call(rbind, out), row.names = NULL) }
+R3m <- mkret(basket_q, "tb3"); R10 <- mkret(basket_q, "rf"); REnd <- mkret(basket_e, "tb3")
+perf_full <- metrics(R3m); perf_pre <- metrics(R3m[R3m$qk < 20211, ]); perf_post <- metrics(R3m[R3m$qk >= 20211, ])
+perf_full_gs10 <- metrics(R10); perf_pre_gs10 <- metrics(R10[R10$qk < 20211, ])
+perf_post_gs10 <- metrics(R10[R10$qk >= 20211, ]); perf_end <- metrics(REnd)
+eff_n <- data.frame(asset = assets, n_returns = sapply(assets, function(a) sum(is.finite(R3m[[a]]))))
+agg_r <- idx_ret(idx_qtr)
+cb <- na.omit(data.frame(y = R3m$Youngtimer - R3m$rf_q, x = R3m$SP500 - R3m$rf_q,
+                         vd = basket_q$VIX - mean(basket_q$VIX, na.rm=TRUE)))
+cbfit <- lm(y ~ x + I(x*vd), data = cb)
+cond_beta <- cbind(term = c("alpha","beta0","beta1_VIX"),
+                   as.data.frame(coeftest(cbfit, vcov = vcovHC(cbfit,"HC1"))[, ]))
+rownames(cond_beta) <- NULL
+## R2: return properties and cost sensitivity
+rr <- as.numeric(agg_r)[-1]
+ac <- acf(rr, lag.max = 4, plot = FALSE)$acf[2:5]
+j <- merge(data.frame(qtr = names(agg_r), y = as.numeric(agg_r)), mkt_r, by = "qtr")
+j <- j[order(j$qtr), ]; j$xl <- c(NA, head(j$SP500,-1))
+dj <- na.omit(data.frame(y = j$y-j$rf, x = j$SP500-j$rf, xl = j$xl-j$rf))
+f1 <- lm(y~x, dj); f2 <- lm(y~x+xl, dj)
+gross <- (tail(idx_qtr$index,1)/100)^(4/length(rr)) - 1
+ret_props <- data.frame(stat = c("arithmetic annualised mean (%)","compound annual growth (%)",
+  "annualised volatility (%)","autocorr lag1","autocorr lag2","autocorr lag3","autocorr lag4",
+  "Ljung-Box 4 lags p","beta contemporaneous","beta contemporaneous p","Dimson sum beta",
+  "Dimson lag coefficient","Dimson lag p"),
+  value = round(c(mean(rr)*400, 100*gross, sd(rr)*200, ac, Box.test(rr, lag=4, type="Ljung-Box")$p.value,
+    coef(f1)["x"], coeftest(f1, vcov=vcovHC(f1,"HC1"))["x",4], sum(coef(f2)[c("x","xl")]),
+    coef(f2)["xl"], coeftest(f2, vcov=vcovHC(f2,"HC1"))["xl",4]), 4))
+cost_sens <- expand.grid(round_trip_cost = c(0.05,0.10,0.15), holding_years = c(3,5,10))
+cost_sens$net_annual_pct <- round(100*((1+gross)*(1-cost_sens$round_trip_cost)^(1/cost_sens$holding_years)-1),2)
+cost_sens$gross_annual_pct <- round(100*gross, 2)
+
+## ---- 10. interaction tests -------------------------------------------------
+inter_full <- function(sr, mcol, brk = "2021 Q1", excess = TRUE, mk = mkt_r) {
+  jj <- merge(data.frame(qtr = names(sr), y = as.numeric(sr)), mk[, c("qtr",mcol,"rf")], by = "qtr")
+  jj <- jj[complete.cases(jj), ]; jj$POST <- as.integer(jj$qtr >= brk)
+  jj$yy <- if (excess) jj$y - jj$rf else jj$y
+  jj$xx <- if (excess) jj[[mcol]] - jj$rf else jj[[mcol]]
+  m <- lm(yy ~ xx + POST + xx:POST, data = jj); V <- vcovHC(m,"HC1")
+  ct <- coeftest(m, vcov = V); ci <- coefci(m, vcov. = V)
+  r1 <- cor(jj$y[jj$POST==0], jj[[mcol]][jj$POST==0]); r2 <- cor(jj$y[jj$POST==1], jj[[mcol]][jj$POST==1])
+  z <- (atanh(r2)-atanh(r1))/sqrt(1/(sum(jj$POST==0)-3)+1/(sum(jj$POST==1)-3))
+  data.frame(market = mcol, break_at = brk, n = nrow(jj), beta_pre = ct["xx",1],
+    delta_beta = ct["xx:POST",1], se = ct["xx:POST",2], ci_low = ci["xx:POST",1],
+    ci_high = ci["xx:POST",2], p = ct["xx:POST",4], rho_pre = r1, rho_post = r2,
+    fisher_p = 2*pnorm(-abs(z)), row.names = NULL) }
+EXC <- function(m) m %in% c("SP500","MSCI","BTC")
+bench <- c("SP500","MSCI","BTC","K500","K50")
+interaction_tests <- rbind(
+  cbind(convention = "quarterly average", do.call(rbind, lapply(bench, function(m) inter_full(agg_r,m,"2021 Q1",EXC(m))))),
+  cbind(convention = "quarterly average", do.call(rbind, lapply(bench, function(m) inter_full(agg_r,m,"2020 Q3",EXC(m))))),
+  cbind(convention = "quarter-end",       do.call(rbind, lapply(bench, function(m) inter_full(agg_r,m,"2021 Q1",EXC(m),mkt_e)))))
+sel <- interaction_tests$convention == "quarterly average" & interaction_tests$break_at == "2021 Q1"
+interaction_tests$p_holm <- NA; interaction_tests$p_BH <- NA
+interaction_tests$p_holm[sel] <- p.adjust(interaction_tests$p[sel], "holm")
+interaction_tests$p_BH[sel] <- p.adjust(interaction_tests$p[sel], "BH")
+fin_interaction <- rbind(
+  cbind(index = "Aggregate", inter_full(agg_r,"SP500")), cbind(index = "Aggregate", inter_full(agg_r,"MSCI")),
+  cbind(index = "Aggregate", inter_full(agg_r,"K500", excess = FALSE)),
+  cbind(index = "R1", inter_full(rl0[[i1]], "SP500")))
+corr_prepost <- do.call(rbind, lapply(c("Aggregate","R1","R2","R3"), function(nm) {
+  sr <- if (nm == "Aggregate") agg_r else rl0[[match(nm, labels3)]]
+  do.call(rbind, lapply(c(mkts,"K50"), function(m) {
+    jj <- merge(data.frame(qtr = names(sr), s = as.numeric(sr)), mkt_r[,c("qtr",m,"POST")], by="qtr")
+    jj <- jj[complete.cases(jj), ]
+    data.frame(series = nm, market = m, pre = round(cor(jj$s[jj$POST==0], jj[[m]][jj$POST==0]),3),
+               post = round(cor(jj$s[jj$POST==1], jj[[m]][jj$POST==1]),3), row.names = NULL) })) }))
+## alternative index specifications
+alt_index_tests <- rbind(
+  cbind(index = "baseline",          do.call(rbind, lapply(c("SP500","MSCI"), function(m) inter_full(agg_r,m)))),
+  cbind(index = "chained",           do.call(rbind, lapply(c("SP500","MSCI"), function(m) inter_full(idx_ret(idx_chain),m)))),
+  cbind(index = "use x POST",        do.call(rbind, lapply(c("SP500","MSCI"), function(m) inter_full(idx_ret(idx_usePOST),m)))),
+  cbind(index = "frequent cells", do.call(rbind, lapply(c("SP500","MSCI"), function(m) inter_full(idx_ret(idx_fixed),m)))),
+  cbind(index = "raw returns",       do.call(rbind, lapply(c("SP500","MSCI"), function(m) inter_full(agg_r,m,excess=FALSE)))))
+alt_index_levels <- data.frame(
+  index = c("baseline (constant implicit prices)","chained adjacent-period","use attributes x POST",
+            "fixed model-platform composition","truncated at US$50,000"),
+  end_2026Q1 = c(round(tail(idx_qtr$index,1),1), round(tail(idx_chain$index,1),1),
+                 round(tail(idx_usePOST$index,1),1), round(tail(idx_fixed$index,1),1), NA))
+## R1 index with and without interpolation
+ix_r1 <- reg_index(d$segn == "R1")
+interp_effect <- rbind(cbind(spec = "interpolated", inter_full(idx_ret(interp_index(ix_r1)),"SP500")),
+                       cbind(spec = "gaps kept",    inter_full(idx_ret_full(ix_r1, PER),"SP500")))
+## supF (Andrews 1993)
+supf <- do.call(rbind, lapply(c("SP500","MSCI","K50"), function(m) {
+  jj <- merge(data.frame(qtr = names(agg_r), y = as.numeric(agg_r)), mkt_r[,c("qtr",m,"rf")], by="qtr")
+  jj <- jj[complete.cases(jj), ]; jj <- jj[order(jj$qtr), ]
+  jj$yy <- if (EXC(m)) jj$y - jj$rf else jj$y; jj$xx <- if (EXC(m)) jj[[m]] - jj$rf else jj[[m]]
+  do.call(rbind, lapply(c(0.20,0.15), function(fr) do.call(rbind, lapply(c("HC1","classical"), function(vt) {
+    fs <- if (vt == "HC1") Fstats(yy~xx, data=jj, from=fr, vcov.=function(x,...) vcovHC(x, type="HC1", ...))
+          else Fstats(yy~xx, data=jj, from=fr)
+    st <- sctest(fs, type = "supF")
+    data.frame(market=m, trimming=fr, vcov=vt, supF=unname(st$statistic), p=unname(st$p.value),
+               break_at=jj$qtr[fs$breakpoint], obs_after=nrow(jj)-fs$breakpoint) })))) }))
+## R2: K50 benchmark discontinuity
+k50_diag <- data.frame(month = format(raw$date,"%Y-%m"), K50 = raw$K50, K500 = raw$K500,
+  K50_growth_pct = round(100*c(NA, diff(raw$K50)/head(raw$K50,-1)),2),
+  K500_growth_pct = round(100*c(NA, diff(raw$K500)/head(raw$K500,-1)),2))
+k50_diag <- k50_diag[k50_diag$month >= "2024-01", ]
+drop26 <- function(sr, m, ex) { mk <- mkt_r[!grepl("2026", mkt_r$qtr), ]; inter_full(sr, m, excess = ex, mk = mk) }
+k50_wo2026 <- rbind(cbind(window = "full", do.call(rbind, lapply(bench, function(m) inter_full(agg_r,m,excess=EXC(m))))),
+                    cbind(window = "excluding 2026 Q1", do.call(rbind, lapply(bench, function(m) drop26(agg_r,m,EXC(m))))))
+## units: 11 models, 7 clusters, 4 subsamples
+sub_index <- function(sub, tv) { sub <- droplevels(sub)
+  index_from(lm(as.formula(paste0(adapt(sub), "+", tv)), data = sub), tv) }
+raw$sem <- paste0(format(raw$date,"%Y"), "-H", ifelse(as.integer(format(raw$date,"%m")) <= 6, 1, 2))
+basket_h <- raw %>% group_by(sem) %>% summarise(across(all_of(cols2), ~mean(.x, na.rm=TRUE)), .groups="drop") %>%
+  arrange(sem) %>% filter(sem <= max(as.character(d$sem)))
+mkt_h <- data.frame(qtr = basket_h$sem)
+for (m in c("MSCI","SP500","BTC","K500","K50")) mkt_h[[m]] <- c(NA, diff(basket_h[[m]])/head(basket_h[[m]],-1))
+mkt_h$rf <- basket_h$tb3/200
+unit_test <- function(sub, label, type) { semi <- nrow(sub) < 350
+  tv <- if (semi) "sem_f" else "qtr_f"; allp <- if (semi) levels(d$sem_f) else PER
+  r <- idx_ret_full(sub_index(sub, tv), allp); mk <- if (semi) mkt_h else mkt_r
+  brk <- if (semi) "2021-H1" else "2021 Q1"
+  cbind(unit = label, type = type, freq = if (semi) "H" else "Q", sales = nrow(sub),
+        rbind(inter_full(r,"SP500",brk,TRUE,mk), inter_full(r,"MSCI",brk,TRUE,mk))) }
+clu <- list(`BMW M` = c("M3 E36","M3 E46","M5 E39"), Porsche = c("Porsche 944","Porsche 986"),
+  Roadsters = c("MAZDA MX5","Z3","SLK 230"), Premium = c("GTR Skyline","M5 E39","M3 E36","M3 E46"),
+  Entry = c("CORVETTE C5","MAZDA MX5","MK1 TT","Porsche 944","Porsche 986","SLK 230","Z3"),
+  German = c("M3 E36","M3 E46","M5 E39","Z3","Porsche 944","Porsche 986","SLK 230","MK1 TT"),
+  NonGerman = c("CORVETTE C5","GTR Skyline","MAZDA MX5"))
+subs <- list(BaT = d[d$house == "Bring a Trailer", ], nonBaT = d[d$house != "Bring a Trailer", ],
+             US = d[d$country == "USA", ], nonUS = d[d$country != "USA", ])
+unit_tests <- do.call(rbind, c(
+  lapply(levels(d$model), function(m) unit_test(d[d$model == m, ], m, "model")),
+  lapply(names(clu), function(k) unit_test(d[d$model %in% clu[[k]], ], k, "cluster")),
+  lapply(names(subs), function(k) unit_test(subs[[k]], k, "subsample"))))
+unit_tests$p_holm <- p.adjust(unit_tests$p, "holm"); unit_tests$p_BH <- p.adjust(unit_tests$p, "BH")
+## truncation at the US$50,000 cap
+trunc_fit <- function(formula, data, cap) {
+  mf <- model.frame(formula, data); y <- model.response(mf); X <- model.matrix(formula, mf)
+  X <- X[, colSums(abs(X)) > 0, drop = FALSE]; q <- qr(X); X <- X[, q$pivot[seq_len(q$rank)], drop = FALSE]
+  b0 <- qr.coef(qr(X), y); s0 <- log(sd(y - drop(X %*% b0)))
+  nll <- function(th) { bb <- th[-length(th)]; s <- exp(th[length(th)]); mu <- drop(X %*% bb)
+    -sum(dnorm(y, mu, s, log = TRUE) - pnorm((cap-mu)/s, log.p = TRUE)) }
+  gr <- function(th) { bb <- th[-length(th)]; s <- exp(th[length(th)]); mu <- drop(X %*% bb)
+    z <- (y-mu)/s; zc <- (cap-mu)/s; lam <- exp(dnorm(zc, log=TRUE) - pnorm(zc, log.p=TRUE))
+    c(-drop(crossprod(X, (z+lam)/s)), -sum(z^2 - 1 + lam*zc)) }
+  o <- optim(c(b0,s0), nll, gr, method = "BFGS", control = list(maxit = 10000, reltol = 1e-12))
+  setNames(o$par[-length(o$par)], colnames(X)) }
+trunc_index <- function(sub) { sub <- droplevels(sub)
+  cc <- trunc_fit(as.formula(paste0(adapt(sub), "+qtr_f")), sub, log(50000))
+  lev <- levels(sub$qtr_f); th <- setNames(rep(0, length(lev)), lev); nm <- paste0("qtr_f", lev)
+  hit <- nm %in% names(cc); th[hit] <- cc[nm[hit]]
+  data.frame(period = lev, index = 100*exp(th - th[1])) }
+truncation <- do.call(rbind, lapply(list(All = d, R1 = d[d$segn == "R1", ]), function(sub) {
+  o <- index_from(lm(as.formula(paste0(adapt(droplevels(sub)), "+qtr_f")), data = droplevels(sub)), "qtr_f")
+  t <- tryCatch(trunc_index(sub), error = function(e) NULL)
+  data.frame(ols_end = round(tail(o$index,1),2), trunc_end = if (is.null(t)) NA else round(tail(t$index,1),2),
+    share_over_40k_pre = round(mean(sub$price[sub$POST == 0] >= 40000),4),
+    share_over_40k_post = round(mean(sub$price[sub$POST == 1] >= 40000),4)) }))
+truncation <- cbind(sample = rownames(truncation), truncation, row.names = NULL)
+alt_index_levels$end_2026Q1[5] <- truncation$trunc_end[1]
+tr_r <- idx_ret_full(trunc_index(d), PER)
+truncation_tests <- rbind(cbind(index="OLS", inter_full(agg_r,"SP500")), cbind(index="truncated", inter_full(tr_r,"SP500")),
+                          cbind(index="OLS", inter_full(agg_r,"MSCI")),  cbind(index="truncated", inter_full(tr_r,"MSCI")))
+## ---- 11. bootstrap: resampling within quarter, both stages re-estimated ----  # R2
+qidx <- split(seq_len(nrow(d)), d$qtr_f)
+boot_one <- function() { ii <- unlist(lapply(qidx, function(ix) sample(ix, length(ix), replace = TRUE)))
+  db <- d[ii, ]; db$qtr_f <- factor(as.character(db$qtr_f), levels = PER)
+  ixb <- index_from(lm(as.formula(paste0(HED, "+qtr_f") %>% paste0("lnprice~", .)), data = db), "qtr_f")
+  rb <- idx_ret(ixb)
+  c(end = tail(ixb$index,1), sp = inter_full(rb,"SP500")$delta_beta,
+    ms = inter_full(rb,"MSCI")$delta_beta, k50 = inter_full(rb,"K50", excess = FALSE)$delta_beta) }
+NB <- 1000
+bsm <- t(replicate(NB, tryCatch(boot_one(), error = function(e) rep(NA,4))))
+bsm <- bsm[complete.cases(bsm), , drop = FALSE]
+bootstrap <- data.frame(quantity = colnames(bsm), reps = nrow(bsm),
+  mean = round(colMeans(bsm),3), sd = round(apply(bsm,2,sd),3),
+  ci_low = round(apply(bsm,2,quantile,0.025),3), ci_high = round(apply(bsm,2,quantile,0.975),3),
+  share_positive = round(colMeans(bsm > 0),3), row.names = NULL)
+
+## ---- 12. checkpoint ---
+save.image(file.path(OUT,'final_state.RData'))
+
+## ---- 14. workbook ----------------------------------------------------------
+guide <- data.frame(sheet = character(), content = character())
+g <- function(s, c_) guide <<- rbind(guide, data.frame(sheet = s, content = c_))
+wb <- createWorkbook(); add <- function(n, df, txt) { addWorksheet(wb, n); writeData(wb, n, df); g(n, txt) }
+add("Idx_monthly", idx_month, "Hedonic index, monthly (Figure 2)")
+add("Idx_quarterly", idx_qtr, "Hedonic index, quarterly - the series used throughout (Figure 2, Table 4)")
+add("Idx_semiannual", idx_sem, "Hedonic index, semi-annual (Figure 2)")
+add("Idx_band", idx_band, "95% confidence band of the quarterly index, clustered by quarter (Figure 2)")
+add("Idx_chained", idx_chain, "Chained adjacent-period index: all implicit prices may drift")
+add("Idx_usePOST", idx_usePOST, "Index from the model with use attributes interacted with the break")
+add("Idx_frequentcells", idx_fixed, "Index re-estimated on model-by-house cells with at least 60 full-sample sales: robustness to excluding infrequent cells, not a reweighting of composition")
+add("Alt_index_levels", alt_index_levels, "End-of-period level of the index under each specification")
+add("Alt_index_tests", alt_index_tests, "Pre/post beta change under each index specification")
+add("Hedonic_coeffs", coef_tab, "Table 3: coefficients, HC1 clustered by quarter; usd_marginal = marginal effect at the median")
+add("Marginal_effects", marg_tab, "Marginal effects of mileage and age along the distribution (Table 3 notes)")
+add("Diagnostics", diag_tab, "N, adj-R2, Breusch-Pagan, Durbin-Watson, medians, age turning point")
+add("GVIF", gvif, "Generalised variance inflation factors")
+add("A1_use_x_post", a1_inter, "Axis A1: use attributes interacted with the break")
+add("A1_wald", a1_wald, "Axis A1: joint Wald tests")
+add("A1_mileage", a1_mileage, "Axis A1: mileage penalty before and after the break")
+add("FMM_selection", fmm_sel, "Mixture: logLik, AIC, BIC and class sizes for k = 1 to 4")
+add("Seg_profile", seg_profile, "Table 5: size, median price, mileage, gearbox and originality by regime")
+add("Seg_comovement", seg_comovement, "Table 5: correlation of each regime index with the markets")
+add("Seg_indices", seg_idx, "Figure 3: regime indices, missing quarters linearly interpolated")
+add("Seg_band", seg_band, "95% confidence band of each regime index (Figure 3)")
+add("Seg_EM_estimates", em_estimates, "Table 6: EM point estimates by regime")
+add("Seg_EM_inference", em_inference, "Table 6: EM standard errors and p-values")
+add("Seg_cars", seg_cars, "Composition of each regime by model")
+add("Seg_model_price", seg_model_price, "Model implicit prices within each regime")
+add("Seg_share_prepost", seg_share_prepost, "Axis A4: hard-assignment shares before and after 2021")
+add("Seg_share_soft", seg_share_soft, "Axis A4: posterior-weighted shares before and after 2021")
+add("Seg_share_year", seg_share_year, "Axis A4: hard-assignment shares by year")
+add("Seg_share_soft_year", seg_share_soft_year, "Axis A4: posterior-weighted shares by year")
+add("Seg_age", seg_age, "Age profile and share past thirty years by regime")
+add("Seg_risk", seg_risk, "Annualised return and volatility of each regime index")
+add("Seg_thin", seg_thin, "Sensitivity to thin quarters and to interpolation, by regime")
+add("Mixture_robust", mixture_robust, "Mixture estimated with common time, house and country effects: sizes, ARI, shares, key figures")
+add("Mixture_crosstab", mixture_crosstab, "Cross-tabulation of regime membership across specifications")
+add("Interp_effect", interp_effect, "Regime 1 beta change with and without interpolated quarters")
+add("Perf_full", perf_full, "Table 4 Panel A: whole period, risk-free = 3-month Treasury bill")
+add("Perf_preCOVID", perf_pre, "Table 4 Panel B: 2014Q2-2020Q4")
+add("Perf_postCOVID", perf_post, "Table 4 Panel B: 2021Q1-2026Q1")
+add("Perf_full_GS10", perf_full_gs10, "Panel A with the ten-year yield as risk-free rate (previous version)")
+add("Perf_pre_GS10", perf_pre_gs10, "Panel B pre, ten-year yield")
+add("Perf_post_GS10", perf_post_gs10, "Panel B post, ten-year yield")
+add("Perf_quarterend", perf_end, "Panel A with quarter-end benchmark levels")
+add("Eff_sample_sizes", eff_n, "Effective number of quarterly returns per asset")
+add("Cond_beta_VIX", cond_beta, "Beta conditional on the VIX")
+add("Return_properties", ret_props, "Arithmetic vs compound mean, autocorrelation, Ljung-Box, Dimson beta")
+add("Cost_sensitivity", cost_sens, "Annualised return net of round-trip costs")
+add("Corr_prepost", corr_prepost, "Pre/post correlations of each index with each benchmark")
+add("Fin_interaction", fin_interaction, "Table 4 Panel C: pre/post beta change")
+add("Interaction_tests", interaction_tests, "Beta change: five benchmarks, two breaks, two conventions, Holm and BH")
+add("SupF_break", supf, "Andrews (1993) supF for an unknown break, 20% and 15% trimming")
+add("K50_diagnostic", k50_diag, "Monthly K50 and K500 levels: the January 2026 discontinuity")
+add("K50_window", k50_wo2026, "Beta change with and without the last quarter")
+add("Units_interaction", unit_tests, "Beta change for 11 models, 7 clusters and 4 subsamples, Holm and BH")
+add("Truncation", truncation, "Truncated regression at the US$50,000 cap")
+add("Truncation_tests", truncation_tests, "Beta change on the truncated index")
+add("Bootstrap", bootstrap, "Bootstrap of the index level and of the beta changes, both stages re-estimated")
+add("Basket_quarterly", basket_q, "Benchmark levels, quarterly averages of monthly levels")
+add("Basket_quarterend", basket_e, "Benchmark levels, last month of each quarter")
+idx_panel <- raw[, c("date", intersect(names(ren), names(raw)), "tb3")]
+idx_panel$Youngtimer <- setNames(idx_month$index, idx_month$period)[format(idx_panel$date, "%Y-%m")]
+add("Indices_monthly", idx_panel, "Monthly benchmark series as used, including the 3-month Treasury bill")
+
+## ---- 12b. homogeneity of the index, descriptive tables, context -------------  # R3
+## Pettitt (1979) and Buishand (1982) range test, written in base R so that the script
+## needs no package beyond those loaded above. Reported in Sections 3 and 4.2.
+pettitt_test <- function(x) {
+  n <- length(x); U <- numeric(n - 1)
+  for (t in seq_len(n - 1)) U[t] <- sum(outer(x[1:t], x[(t+1):n], function(a, b) sign(a - b)))
+  K <- max(abs(U)); k <- which.max(abs(U))
+  list(K = K, k = k, p = min(1, 2 * exp(-6 * K^2 / (n^3 + n^2)))) }
+buishand_test <- function(x, m = 20000) {
+  stat <- function(z) { S <- cumsum(z - mean(z))
+    c(R = (max(c(0, S)) - min(c(0, S))) / sd(z) / sqrt(length(z)), k = which.max(abs(S))) }
+  o <- stat(x); sim <- replicate(m, stat(rnorm(length(x)))["R"])
+  list(R = unname(o["R"]), k = unname(o["k"]), p = mean(sim >= o["R"])) }
+set.seed(1)
+homogeneity <- do.call(rbind, lapply(list(list("quarterly", idx_qtr), list("monthly", idx_month)),
+  function(z) { lab <- z[[2]]$period; x <- z[[2]]$index
+    p <- pettitt_test(x); b <- buishand_test(x)
+    data.frame(series = z[[1]], n = length(x), pettitt_K = round(p$K, 1),
+      pettitt_p = signif(p$p, 3), pettitt_break = as.character(lab[min(p$k + 1, length(lab))]),
+      buishand_R = round(b$R, 3), buishand_p = round(b$p, 4),
+      buishand_break = as.character(lab[b$k]), row.names = NULL) }))
+
+## Tables 2a and 2b and Figure 1, computed from the transaction file before any recoding.
+desc_f <- function(x) c(N = length(x), Mean = mean(x), SD = sd(x), Min = min(x),
+  Q1 = unname(quantile(x, .25)), Median = median(x), Q3 = unname(quantile(x, .75)),
+  Max = max(x), Skewness = mean(((x - mean(x))/sd(x))^3))
+desc_cont <- data.frame(Statistic = c("N","Mean","SD","Min","Q1","Median","Q3","Max","Skewness"),
+  `Ln price (US$)` = round(desc_f(log(d_raw$price)), 3),
+  `Mileage (k)`    = round(desc_f(suppressWarnings(as.numeric(d_raw$mi))/1000), 3),
+  `Age (years)`    = round(desc_f(d_raw$syear - d_raw$myear), 3),
+  check.names = FALSE, row.names = NULL)
+desc_cat <- do.call(rbind, Map(function(lab, v) {
+    t <- sort(table(d_raw[[v]]), decreasing = TRUE)
+    data.frame(Variable = lab, Category = names(t), n = as.integer(t),
+               pct = round(100 * as.integer(t)/nrow(d_raw), 1), row.names = NULL) },
+  c("Authenticity","Transmission","Direction","Country","Auction house","Model"),
+  c("auth","trans","dir","country","house","model")))
+sales_qtr <- as.data.frame(table(as.character(d$qtr_f)), stringsAsFactors = FALSE)
+names(sales_qtr) <- c("quarter", "sales")
+
+## Do implicit prices vary with platform, country and period, and does context predict
+## regime membership? Supports the residualization sensitivity of Sections 3 and 4.4.
+d$POST <- as.integer(as.character(d$qtr_f) >= "2021 Q1")
+d$BaT  <- as.integer(d$house == "Bring a Trailer"); d$USA <- as.integer(d$country == "USA")
+HEDc <- "agec+agec2+mi_k+mi_k2+tmu+auth+trans+dir+model+country+house"; mm <- median(d$mi_k)
+ctx_row <- function(v, lab) {
+  f <- lm(as.formula(paste0("lnprice~", HEDc, "+qtr_f+(agec+agec2+mi_k+mi_k2+tmu+trans):", v)), data = d)
+  V <- vcovCL(f, cluster = ~qtr_f); ip <- grep(paste0(":", v, "$"), names(coef(f)), value = TRUE)
+  b <- coef(f)
+  data.frame(split = lab, joint_p = round(linearHypothesis(f, ip, vcov. = V, test = "F")[2, "Pr(>F)"], 5),
+    mileage_pct_base  = round(100*(b["mi_k"] + 2*b["mi_k2"]*mm), 3),
+    mileage_pct_other = round(100*((b["mi_k"] + b[paste0("mi_k:", v)]) +
+                                   2*(b["mi_k2"] + b[paste0("mi_k2:", v)])*mm), 3), row.names = NULL) }
+context_slopes <- rbind(ctx_row("BaT", "Bring a Trailer vs other platforms"),
+                        ctx_row("USA", "United States vs other countries"),
+                        ctx_row("POST", "after 2020 vs before"))
+m0 <- glm(I(segn == "R1") ~ 1, data = d, family = binomial)
+mcf <- function(f) round(1 - as.numeric(logLik(f))/as.numeric(logLik(m0)), 4)
+context_fit <- data.frame(predictors = c("context (house, country, quarter)",
+    "vehicle characteristics", "both"),
+  McFadden_pseudo_R2 = c(mcf(glm(I(segn=="R1") ~ house+country+qtr_f, data = d, family = binomial)),
+    mcf(glm(I(segn=="R1") ~ agec+agec2+mi_k+mi_k2+tmu+trans+auth+model, data = d, family = binomial)),
+    mcf(glm(I(segn=="R1") ~ house+country+qtr_f+agec+agec2+mi_k+mi_k2+tmu+trans+auth+model,
+            data = d, family = binomial))))
+comp <- function(v, nm) { t <- table(d[[v]], d$segn)
+  x <- as.data.frame.matrix(round(100*prop.table(t, 1), 1))
+  data.frame(dimension = nm, level = rownames(x), x, n = as.integer(rowSums(t)), row.names = NULL) }
+ty <- table(format(d$sdate, "%Y"), d$segn)
+regime_composition <- rbind(comp("house", "auction house"), comp("country", "country"),
+  data.frame(dimension = "year", level = rownames(ty),
+             as.data.frame.matrix(round(100*prop.table(ty, 1), 1)),
+             n = as.integer(rowSums(ty)), row.names = NULL))
+
+## Identity, units and observation convention of every benchmark actually used.        # R3
+benchmark_sources <- data.frame(
+  column = c("K50","K500","Coins","Gold","MSCI","BTC","SP500","Wine","Art","ArtC","Whisky","VIX","tb3"),
+  series = c("K50 classic-car index","K500 classic-car index","Rare Coin Index 100",
+             "SPDR Gold Shares (GLD)","iShares MSCI World ETF (URTH)","Bitcoin / USD",
+             "S&P 500 (^GSPC)","Liv-ex 1000","Artprice Global","Artprice Contemporary",
+             "Rare Whisky Icon 100","CBOE Volatility Index (VIX)",
+             "3-month Treasury bill, secondary market (TB3MS)"),
+  provider = c("classic.com","classic.com","index publisher","Yahoo Finance","Yahoo Finance",
+               "Yahoo Finance","Yahoo Finance","Liv-ex","Artprice","Artprice","Rare Whisky 101",
+               "Yahoo Finance","FRED"),
+  units = c(rep("index level", 3), "USD per share", "USD per share", "USD", "index points",
+            rep("index level", 4), "index points", "percent per annum"),
+  observation = c(rep("monthly level as published", 3), rep("last trading day of the month", 4),
+                  rep("monthly level as published", 4), "last trading day of the month",
+                  "monthly average of business days"),
+  distributions = c(rep("not applicable", 3), "price only, fund pays no distribution",
+                    "price only, distributions excluded", "not applicable",
+                    "price index, dividends excluded", rep("not applicable", 6)),
+  stringsAsFactors = FALSE)
+
+add("Homogeneity", homogeneity, "Pettitt and Buishand range tests of index homogeneity (Sections 3 and 4.2)")
+add("Benchmark_sources", benchmark_sources, "Identity, units and observation convention of each benchmark (Section 2, Table 4 notes)")
+add("Desc_continuous", desc_cont, "Table 2a: descriptive statistics of the continuous variables")
+add("Desc_categorical", desc_cat, "Table 2b: frequencies of the categorical variables")
+add("Sales_per_quarter", sales_qtr, "Figure 1: number of recorded sales per quarter")
+add("Context_slopes", context_slopes, "Do implicit prices vary with platform, country and period, and how well context predicts regime membership")
+add("Regime_composition", regime_composition, "Share of each regime by auction house, country and year")
+add("Data", Final_data, "Transaction file: 5,922 completed auction sales, 17 fields (input of the script)")
+
+
+## Versions of R and of the packages used, so that the run can be reproduced exactly.   # R3
+session_info <- rbind(
+  data.frame(component = "R", version = paste(R.version$major, R.version$minor, sep = "."),
+             stringsAsFactors = FALSE),
+  data.frame(component = c("readxl","dplyr","stringr","flexmix","sandwich","lmtest","car","zoo",
+                           "openxlsx","strucchange"),
+             version = sapply(c("readxl","dplyr","stringr","flexmix","sandwich","lmtest","car","zoo",
+                                "openxlsx","strucchange"),
+                              function(p) as.character(utils::packageVersion(p))),
+             stringsAsFactors = FALSE))
+add("Session_info", session_info, "R and package versions of the run that produced this workbook")
+
+addWorksheet(wb, "Reading guide", tabColour = "grey"); writeData(wb, "Reading guide", guide)
+ord <- c(which(names(wb) == "Reading guide"), which(names(wb) == "Data"))                 # R3
+worksheetOrder(wb) <- c(ord, setdiff(seq_along(names(wb)), ord))
+saveWorkbook(wb, file.path(OUT, "youngtimers_results_R2.xlsx"), overwrite = TRUE)
+
+## ---- 13. figures ------------------------------------------------------------
+png(file.path(OUT,"fig1.png"), width = 1600, height = 1000, res = 200)
+vol <- as.data.frame(table(d$qtr_f)); par(mar = c(4,4,1,1))
+plot(seq_len(nrow(vol)), vol$Freq, type = "h", lwd = 6, col = "grey35", xaxt = "n",
+     xlab = "", ylab = "Number of recorded sales")
+at <- seq(1, nrow(vol), by = 4); axis(1, at = at, labels = PER[at], las = 2, cex.axis = .7)
+dev.off()
+png(file.path(OUT,"fig2.png"), width = 1600, height = 1000, res = 200)
+par(mar = c(4,4,1,1)); x <- seq_len(nrow(idx_band))
+## The three frequencies are put on a common level by rescaling the monthly and the      # R3
+## half-yearly index to the quarterly 2014 average, as the figure note states. Returns
+## and correlations are invariant to this rescaling.
+base14 <- function(ix) mean(ix$index[grepl("^2014", ix$period)])
+sc_m <- base14(idx_qtr)/base14(idx_month); sc_s <- base14(idx_qtr)/base14(idx_sem)
+mon_r <- idx_month$index * sc_m; sem_r <- idx_sem$index * sc_s
+plot(x, idx_band$index, type = "n", ylim = range(c(idx_band$lo, idx_band$hi, mon_r, sem_r)),
+     xaxt = "n", xlab = "", ylab = "Index (2014-Q1 = 100)")
+polygon(c(x, rev(x)), c(idx_band$lo, rev(idx_band$hi)), col = "grey88", border = NA)
+mx <- seq(1, nrow(idx_band), length.out = nrow(idx_month))
+lines(mx, mon_r, col = "grey60", lwd = 1)
+lines(x, idx_qtr$index, col = "black", lwd = 2)
+sx <- seq(1, nrow(idx_band), length.out = nrow(idx_sem)); lines(sx, sem_r, col = "grey30", lty = 2, lwd = 1.5)
+axis(1, at = at, labels = PER[at], las = 2, cex.axis = .7)
+legend("topleft", c("Quarterly (95% band)","Monthly","Semi-annual"), col = c("black","grey60","grey30"),
+       lty = c(1,1,2), lwd = c(2,1,1.5), bty = "n", cex = .8)
+dev.off()
+png(file.path(OUT,"fig3.png"), width = 1600, height = 1000, res = 200)
+par(mar = c(4,4,1,1)); cols3 <- c(R1 = "black", R2 = "grey40", R3 = "grey70")
+rng <- range(c(50, 260)); x <- seq_len(length(PER))
+plot(x, rep(NA, length(x)), ylim = rng, xaxt = "n", xlab = "", ylab = "Index (2014-Q1 = 100)")
+for (l in c("R3","R2","R1")) { bb <- seg_band[seg_band$regime == l, ]
+  xi <- match(bb$period, PER)
+  polygon(c(xi, rev(xi)), c(pmax(bb$lo, rng[1]), rev(pmin(bb$hi, rng[2]))),
+          col = adjustcolor(cols3[[l]], alpha.f = .15), border = NA) }
+for (l in c("R1","R2","R3")) { ii <- interp_index(reg_index(d$segn == l))
+  lines(match(ii$period, PER), ii$index, col = cols3[[l]], lwd = 2) }
+axis(1, at = at, labels = PER[at], las = 2, cex.axis = .7)
+legend("topleft", c("Regime 1","Regime 2","Regime 3"), col = cols3, lwd = 2, bty = "n", cex = .8)
+dev.off()
+
+## ---- 15. console summary ----------------------------------------------------
+cat("\n=== CHECKS ===\n")
+cat(sprintf("n = %d | adj-R2 %.4f | index end %.2f | FMM sizes %s\n", nrow(d),
+            summary(m_qtr)$adj.r.squared, tail(idx_qtr$index,1), fmm_sel$sizes[3]))
+print(mixture_robust[, c("spec","sizes","ARI_vs_M0","mean_max_posterior","R1_share_pre","R1_share_post",
+                         "R1_rho_SP","R1_end","R2_end")])
+print(interaction_tests[, c("convention","market","break_at","delta_beta","p","p_holm","rho_pre","rho_post")], digits = 3)
+print(alt_index_levels); print(bootstrap); print(ret_props); print(seg_thin, row.names = FALSE)
+print(perf_full[1:3, ]); print(perf_pre[1:3, ]); print(perf_post[1:3, ])
+print(supf, digits = 3); print(k50_wo2026[, c("window","market","delta_beta","p","rho_pre","rho_post")], digits = 3)
+cat("\nunits significant after Holm:", sum(unit_tests$p_holm < 0.05), "/ after BH:", sum(unit_tests$p_BH < 0.05), "\n")
+cat("[final run complete]\n")
